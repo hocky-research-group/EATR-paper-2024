@@ -1,0 +1,19 @@
+d1: DISTANCE ATOMS=1,2 COMPONENTS
+
+# Matched Harmonics Potential
+# U(x<0) = (0.5*ΔE/(xa^2))*(x-xa)^2 - 0.5*ΔE, U(x>0) = (-0.5*ΔE/(xh^2))*(x-xh)^2 + 0.5*ΔE
+# ΔE = 8, xa = -3.0, xh = +3.0
+ff: MATHEVAL ARG=d1.x PERIODIC=NO FUNC=(0.444444*(x+3)^2-4)*step(-1.0*x)+(-0.444444*(x-3)^2+4)*step(x)
+bb: BIASVALUE ARG=ff
+
+COMMITTOR ...
+	ARG=d1.x
+	STRIDE=1
+	BASIN_LL1=8.0
+	BASIN_UL1=20.0
+... COMMITTOR
+
+
+PRINT ARG=* FILE=unbiased.colvar STRIDE=1000
+
+

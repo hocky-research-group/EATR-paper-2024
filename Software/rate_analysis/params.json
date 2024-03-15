@@ -1,0 +1,1 @@
+{"head_dir":"test/", "beta":0.3855097673, "columns":{"time":0,"bias":3,"acc":4,"max_bias":null}, "colvar_name":"metad.colvar", "log_name":"p.log", "plog_len":1 ,"directories":["pace1","pace2"], "num_runs":100}

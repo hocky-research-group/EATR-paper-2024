@@ -1,0 +1,1 @@
+{"head_dir":"../../Data/X_matched_harmonics_wt/", "beta":1.0, "columns":{"time":0,"bias":2,"acc":3,"max_bias":null}, "colvar_name":"metad.colvar", "log_name":"metad.colvar", "plog_len":1 ,"directories":["xruns_pace1e3","xruns_pace1e4","xruns_pace1e5","xruns_pace1e6"], "num_runs":100, "results_file":"../../Results/Rates/rates_X_wt.json"}
