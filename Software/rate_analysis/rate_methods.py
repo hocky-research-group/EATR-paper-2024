@@ -264,63 +264,6 @@ def EATR_CDF_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, k_guess, 
     spline = EATR_calculate_avg_acc(cdf_result[0][1], v_data, beta, ix_col, logTrick=logTrick)
     return cdf_result[0], spline
 
-def SepBias_calculate_log_l(gamma, event, t, splines, logTrick=False):
-    
-    cum_hazs = []
-    for i in range(len(t)):
-        cum_hazs.append(KTR_calculate_cum_hazard(gamma, splines[i], logTrick, t[i]))
-    cum_hazard = np.array(cum_hazs)
-
-    log_hazard = SepBias_calculate_log_hazard(gamma, t, splines)
-
-    mean_t = cum_hazard.sum() / event.sum()
-    log_l = -event.sum() * np.log(mean_t) + log_hazard[event].sum() - (1 / mean_t) * cum_hazard.sum()
-
-    return -log_l
-
-def SepBias_calculate_log_hazard(gamma, t, splines):
-    Vs = []
-    for i in range(len(t)):
-        spline = splines[i]
-        time = t[i]
-        Vs.append(spline(time))
-    Veff = np.array(Vs)
-    return gamma * Veff
-
-def KTR_pre_calculate_log_l(gamma, event, t, splines, ksplines, logTrick=False):
-
-    cum_hazs = []
-    for i in range(len(t)):
-        cum_hazs.append(KTR_pre_calculate_cum_hazard(gamma, splines[i], t[i], ksplines[i], logTrick))
-    cum_hazard = np.array(cum_hazs)
-
-    log_hazard = KTR_pre_calculate_log_hazard(gamma, t, splines, ksplines)
-
-    mean_t = cum_hazard.sum() / event.sum()
-    log_l = -event.sum() * np.log(mean_t) + log_hazard[event].sum() - (1 / mean_t) * cum_hazard.sum()
-
-    return -log_l
-
-def KTR_pre_calculate_cum_hazard(gamma, spline, t, kspline, logTrick):
-    dt = 1.
-    if logTrick:
-        max_spline = optimize.minimize_scalar(neg_spline, args=(spline)).x
-        t_points = np.arange(0,t,dt)
-        return 0.5*dt*(1 + kspline(t)*np.exp(spline(t)) + 2*np.exp(max_spline + np.log((kspline(t_points[1:])*np.exp(spline(t_points[1:]) - max_spline)).sum())))
-    else:
-        int_Veff = integrate.quad(lambda x: kspline(x)*np.exp(gamma * spline(x)), 0, t)[0]
-        return int_Veff
-
-def KTR_pre_calculate_log_hazard(gamma, t, splines, ksplines):
-    lnhaz = []
-    for i in range(len(t)):
-        spline = splines[i]
-        kspline = ksplines[i]
-        time = t[i]
-        lnhaz.append(gamma*spline(time) + np.log(kspline(time)))
-    lnhaz_array = np.array(lnhaz)
-    return lnhaz_array
-
 def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name,plog_len,cores,ks_ranges=False,boots=False,logTrick=False):
 
     results = {
