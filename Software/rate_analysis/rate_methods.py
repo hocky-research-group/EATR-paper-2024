@@ -34,6 +34,12 @@ def bootstrap(sample,func,nresamples,double=False):
 def neg_spline(x, spline):
     return -1*spline(x)
 
+def calc_acc(data, tcol, biascol, beta, bias_shift=0.0):
+    acc = np.zeros(len(data))
+    for i in range(len(data)):
+        acc[i] = np.trapz(np.exp(beta*(data[i][:,biascol] + bias_shift)),data[i][:,tcol]) / data[i][-1,tcol]
+    return acc
+
 # Infrequent Metadynamics Tiwary Estimator
 def iMetaD_invMRT(times, event, rescale=False, acc=None):
     if rescale and acc is not None:
@@ -61,7 +67,7 @@ def iMetaD_FitCDF(times, event, k_guess):
     return optimize.curve_fit(iMetaD_CDF, ecdfx, ecdfy, p0=k_guess)[0][0]
 
 # Kramers' Time-dependent Rate method log likelihood function. (The logTrick uses the log-sum-exp trick to ideally increase precision for large exponents.)
-def KTR_calculate_log_l(gamma, event, t, spline, cores=4, logTrick=False):
+def KTR_calculate_log_l(gamma, event, t, spline, cores=4, logTrick=False, reg_lambda=0.0):
 
     p =  mp.Pool(cores)
     func = partial(KTR_calculate_cum_hazard, gamma, spline, logTrick)
@@ -73,7 +79,9 @@ def KTR_calculate_log_l(gamma, event, t, spline, cores=4, logTrick=False):
     mean_t = cum_hazard.sum() / event.sum()
     log_l = -event.sum() * np.log(mean_t) + log_hazard[event].sum() - (1 / mean_t) * cum_hazard.sum()
 
-    return -log_l
+    gdiff = 0.5-gamma
+
+    return -log_l + reg_lambda*gdiff*gdiff
 
 def KTR_calculate_cum_hazard(gamma, spline, logTrick, t):
     dt=1.
@@ -97,7 +105,14 @@ def KTR_CDF(t, k0, gamma, spline, cores=4, logTrick=False):
     p.close()
     return 1 - np.exp(-k0 * cum_hazard)
 
-def avg_max_bias(maxbias, data, colvars_count, colvars_maxrow_count, beta):
+def KTR_leastsq_cost(params, t, ecdfy, spline, cores=4, logTrick=False, reg_lambda=0.0, kIMD=1.0):
+    f = KTR_CDF(t, params[0], params[1], spline, cores=4, logTrick=False)
+    sse = np.square(ecdfy-f).sum()
+    gdiff = 0.5 - params[1]
+    kdiff = 10*kIMD - params[0]
+    return sse + reg_lambda*(kdiff*kdiff + gdiff*gdiff)
+
+def avg_max_bias(maxbias, data, colvars_count, colvars_maxrow_count, beta, bias_shift=0.0):
     vmb_data = np.empty((colvars_count, colvars_maxrow_count))
     vmb_data.fill(np.nan)
     ix_col = None
@@ -119,15 +134,15 @@ def avg_max_bias(maxbias, data, colvars_count, colvars_maxrow_count, beta):
     masked_vmb = np.ma.masked_array(vmb_data, np.isnan(vmb_data))
     vmb_average = np.ma.average(masked_vmb.T, axis=1)
     vmb_average = np.vstack((ix_col, vmb_average)).T
-    vmb_average[:,1] *= beta
+    vmb_average[:,1] = (vmb_average[:,1] + bias_shift) * beta
 
     return vmb_average
 
-def KTR_MLE_rate(vmb_average, t, event, gamma_bounds, cores, logTrick):
+def KTR_MLE_rate(vmb_average, t, event, gamma_bounds, cores, logTrick, reg_lambda=0.0):
     unique_T = vmb_average[:,0]
     unique_V = vmb_average[:,1]
     spline = interpolate.UnivariateSpline(unique_T, unique_V, s=0, ext=3)
-    opt = optimize.minimize_scalar(KTR_calculate_log_l, bounds=gamma_bounds, method='bounded', args=(event, t, spline, cores, logTrick))
+    opt = optimize.minimize_scalar(KTR_calculate_log_l, bounds=gamma_bounds, method='bounded', args=(event, t, spline, cores, logTrick, reg_lambda))
     gamma = opt.x
 
     p =  mp.Pool(cores)
@@ -138,7 +153,7 @@ def KTR_MLE_rate(vmb_average, t, event, gamma_bounds, cores, logTrick):
     mean_t = cum_hazard.sum() / event.sum()
     return np.array([1/mean_t, gamma]), spline
 
-def KTR_CDF_rate(vmb_average, t, gamma_bounds, event, cores, logTrick, k_guess):
+def KTR_CDF_rate(vmb_average, t, gamma_bounds, event, cores, logTrick, k_guess, reg_lambda=0.0, kIMD=1.0):
     
     # 2-parameter CDF fitting for gamma and k0
     counts = np.sort(t[event])
@@ -149,9 +164,12 @@ def KTR_CDF_rate(vmb_average, t, gamma_bounds, event, cores, logTrick, k_guess):
     unique_V = vmb_average[:,1]
     spline = interpolate.UnivariateSpline(unique_T, unique_V, s=0, ext=3)
 
-    def KTR_CDF_simple(t,k0,gamma):
-        return KTR_CDF(t,k0,gamma,spline,logTrick=logTrick)
-    cdf_result = optimize.curve_fit(KTR_CDF_simple, ecdf_data[:,0], ecdf_data[:,1], p0=k_guess, bounds=([-np.inf,gamma_bounds[0]],[np.inf,gamma_bounds[1]]))
+    if reg_lambda == 0.0:
+        def KTR_CDF_simple(t,k0,gamma):
+            return KTR_CDF(t,k0,gamma,spline,logTrick=logTrick)
+        cdf_result = optimize.curve_fit(KTR_CDF_simple, ecdf_data[:,0], ecdf_data[:,1], p0=k_guess, bounds=([-np.inf,gamma_bounds[0]],[np.inf,gamma_bounds[1]]))
+    else:
+        cdf_result = (optimize.minimize(KTR_leastsq_cost,k_guess,args=(ecdf_data[:,0],ecdf_data[:,1],spline,cores,logTrick,reg_lambda,kIMD)).x,)
     return cdf_result[0], spline
 
 def EATR_calculate_avg_acc(gamma, v_data, beta, ix_col, logTrick=False):
@@ -170,7 +188,7 @@ def EATR_calculate_avg_acc(gamma, v_data, beta, ix_col, logTrick=False):
         spline = interpolate.UnivariateSpline(acc_average[:,0], acc_average[:,1], s=0, ext=3)
         return spline
 
-def EATR_calculate_log_l(gamma, event, t, spline, cores=4, logTrick=False):
+def EATR_calculate_log_l(gamma, event, t, spline, cores=4, logTrick=False, reg_lambda=0.0):
 
     p =  mp.Pool(cores)
     func = None
@@ -185,7 +203,9 @@ def EATR_calculate_log_l(gamma, event, t, spline, cores=4, logTrick=False):
     mean_t = cum_hazard.sum() / event.sum()
     log_l = -event.sum() * np.log(mean_t) + log_hazard[event].sum() - (1 / mean_t) * cum_hazard.sum()
 
-    return -log_l
+    gdiff = 0.5-gamma
+
+    return -log_l + reg_lambda*gdiff*gdiff
 
 def EATR_calculate_cum_hazard(gamma, spline, logTrick, t):
     dt=1.
@@ -202,7 +222,7 @@ def EATR_calculate_log_hazard(gamma, t, spline):
     Veff = spline(t)
     return Veff
 
-def EATR_CDF(t, k0, gamma, spline, cores, logTrick=False):
+def EATR_CDF(t, k0, gamma, spline, cores=4, logTrick=False):
 
     p =  mp.Pool(cores)
     func = partial(EATR_calculate_cum_hazard, gamma, spline, logTrick)
@@ -210,18 +230,25 @@ def EATR_CDF(t, k0, gamma, spline, cores, logTrick=False):
     p.close()
     return 1 - np.exp(-cum_hazard * k0)
 
-def inst_bias(data, colvars_count, colvars_maxrow_count, beta, biascol):
+def EATR_leastsq_cost(k0, gamma, t, ecdfy, spline, cores=4, logTrick=False, reg_lambda=0.0, kIMD=1.0):
+    f = EATR_CDF(t, k0, gamma, spline, cores=4, logTrick=False)
+    sse = np.square(ecdfy-f).sum()
+    gdiff = 0.5 - gamma
+    kdiff = 10*kIMD - k0
+    return sse + reg_lambda*(kdiff*kdiff + gdiff*gdiff)
+
+def inst_bias(data, colvars_count, colvars_maxrow_count, beta, biascol, bias_shift=0.0):
     v_data = np.empty((colvars_count, colvars_maxrow_count))
     v_data.fill(np.nan)
     ix_col = None
     def fill_v_data(colvar_index):
-        v_column_data = data[colvar_index][:,biascol] #for Vinst, consider making a copy for VMB
+        v_column_data = data[colvar_index][:,biascol]
         diff_rows = colvars_maxrow_count - v_column_data.shape[0]
         if 0 < diff_rows:
             fill_diff = np.empty(diff_rows)
             fill_diff.fill(np.nan)
             v_column_data = np.hstack((v_column_data, fill_diff))
-        v_data[colvar_index,:] = v_column_data
+        v_data[colvar_index,:] = v_column_data + bias_shift
         return data[colvar_index][:,0] if data[colvar_index][:,0].shape[0] == colvars_maxrow_count else None
 
     for i in range(colvars_count):
@@ -231,10 +258,10 @@ def inst_bias(data, colvars_count, colvars_maxrow_count, beta, biascol):
 
     return v_data, ix_col
 
-def EATR_MLE_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, logTrick=False):
+def EATR_MLE_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, logTrick=False, reg_lambda=0.0):
     def log_l_aa(gamma, event, t):
         spline = EATR_calculate_avg_acc(gamma, v_data, beta, ix_col, logTrick=logTrick)
-        return EATR_calculate_log_l(gamma, event, t, spline, cores=cores, logTrick=logTrick)
+        return EATR_calculate_log_l(gamma, event, t, spline, cores=cores, logTrick=logTrick, reg_lambda=reg_lambda)
 
     opt = optimize.minimize_scalar(log_l_aa, bounds=gamma_bounds, method='bounded', args=(event, t))
     gamma = opt.x
@@ -249,7 +276,7 @@ def EATR_MLE_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, logTrick=
 
     return np.array([1/mean_t, gamma]), spline
 
-def EATR_CDF_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, k_guess, logTrick=False):
+def EATR_CDF_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, k_guess, logTrick=False, reg_lambda=0.0, kIMD=1.0):
 
     def tcdf(time, k0, gamma):
         spline = EATR_calculate_avg_acc(gamma, v_data, beta, ix_col, logTrick=logTrick)
@@ -260,11 +287,14 @@ def EATR_CDF_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, k_guess, 
     ecdf = np.arange(1, event.sum() + 1) / len(event)
     ecdf_data=np.column_stack((counts, ecdf))
 
-    cdf_result = optimize.curve_fit(tcdf, ecdf_data[:,0], ecdf_data[:,1], p0=k_guess, bounds=([-np.inf,gamma_bounds[0]],[np.inf,gamma_bounds[1]]))
+    if reg_lambda == 0.0:
+        cdf_result = optimize.curve_fit(tcdf, ecdf_data[:,0], ecdf_data[:,1], p0=k_guess, bounds=([-np.inf,gamma_bounds[0]],[np.inf,gamma_bounds[1]]))
+    else:
+        cdf_result = (optimize.minimize(EATR_leastsq_cost,k_guess,args=(ecdf_data[:,0],ecdf_data[:,1],spline,cores,logTrick,reg_lambda,kIMD)).x,)
     spline = EATR_calculate_avg_acc(cdf_result[0][1], v_data, beta, ix_col, logTrick=logTrick)
     return cdf_result[0], spline
 
-def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name,plog_len,cores,ks_ranges=False,boots=False,logTrick=False):
+def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name,plog_len,cores,rate_conv=1.,ks_ranges=False,boots=False,logTrick=False,incon_names=False,bias_shift=0.0,lambda_KTR=0.0,lambda_EATR=0.0):
 
     results = {
             "iMetaD MLE k": None,
@@ -301,6 +331,7 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
     
     # Figure out what sections of the code need to be run
     actions_needed = {
+            "calc_acc": columns["acc"] is None,
             "avg_max": analyses["KTR Vmb MLE"] or analyses["KTR Vmb CDF"],
             "avg_acc": analyses["EATR MLE"] or analyses["EATR CDF"]
     }
@@ -310,9 +341,14 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
     print(f"{directory}:")
     colvars = []
     plogs = []
-    for run in runs:
-        colvars.append(f"{directory}/{run}/{colvar_name}")
-        plogs.append(f"{directory}/{run}/{log_name}")
+    if incon_names:
+        for run in runs:
+            colvars.append(f"{directory}/{run}/{run}{colvar_name}")
+            plogs.append(f"{directory}/{run}/{run}{log_name}")
+    else:
+        for run in runs:
+            colvars.append(f"{directory}/{run}/{colvar_name}")
+            plogs.append(f"{directory}/{run}/{log_name}")
     
     # Load all colvar files
     colvars_count = len(colvars)
@@ -325,8 +361,12 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
         current_colvar = np.loadtxt(colvar)
         data.append(current_colvar)
         colvars_maxrow_count = data[-1].shape[0] if colvars_maxrow_count is None or colvars_maxrow_count < data[-1].shape[0] else colvars_maxrow_count
-        final_times[i,:] = np.array([data[-1][-1][columns["time"]],data[-1][-1][columns["time"]] * data[-1][-1][columns["acc"]]]) # final_times[i,0] is simulation i's transition time while final_times[i,1] is the iMetaD rescaled time.
+        final_times[i,:] = np.array([data[-1][-1][columns["time"]],data[-1][-1][columns["time"]] * data[-1][-1][columns["acc"]]]) if not actions_needed["calc_acc"] else np.array([data[-1][-1][columns["time"]],0]) # final_times[i,0] is simulation i's transition time while final_times[i,1] is the iMetaD rescaled time.
         i = i+1
+
+    if actions_needed["calc_acc"]:
+        acc = calc_acc(data, columns["time"], columns["bias"], beta, bias_shift=bias_shift)
+        final_times[:,1] = final_times[:,0]*acc
 
     # Count transitions
     event = []
@@ -347,6 +387,7 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
     # from Tiwary and Parinello paper
     taus = final_times[:,1] # Rescaled times
     k_mle = iMetaD_invMRT(taus, event) # Maximum likelihood estimate of the rate, not assuming all simulations transitioned
+    init_guess = [k_mle, 1.0]
 
     def tcdf(x, k):
         return 1 - np.exp(-k * x)
@@ -361,13 +402,13 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
         size = np.int64(len(final_times[:,1])*5e4)
         rvs1 = gamma_func.rvs(1, scale=1/k_mle, size=size)
         ks_stat, p = ks_2samp(rvs1,taus[event])
-        results["iMetaD MLE k"] = k_mle
+        results["iMetaD MLE k"] = k_mle*rate_conv
         if boots:
             res = bootstrap(list(range(N)),select_runs_iMetaD_MLE,100)
             results["iMetaD MLE std k"] = res
-            print(f"iMetaD MLE: logk = {np.log10(k_mle)} +/- {res}, KS: {ks_stat}, p = {p}")
+            print(f"iMetaD MLE: logk = {np.log10(k_mle*rate_conv)} +/- {res}, KS: {ks_stat}, p = {p}")
         else:
-            print(f"iMetaD MLE: k = {k_mle}, KS: {ks_stat}, p = {p}")
+            print(f"iMetaD MLE: k = {k_mle*rate_conv}, KS: {ks_stat}, p = {p}")
 
 
     # from Salvalaglio paper
@@ -375,12 +416,13 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
 
         # Fit ECDF to theoretical CDF
         k = iMetaD_FitCDF(taus, event, k_mle)
+        init_guess[0] = k
 
         # Compute Kolmogorov-Smirnov Statistic
         size = np.int64(len(final_times[:,1])*5e4)
         rvs1 = gamma_func.rvs(1, scale=1/k, size=size)
         ks_stat, p = ks_2samp(rvs1,final_times[:,1]) # 2-sample test because that's what's commonly used, apparently.
-        results["iMetaD CDF k"] = k
+        results["iMetaD CDF k"] = k*rate_conv
 
         if boots:
             def select_runs_iMetaD_CDF(run_idx):
@@ -389,9 +431,9 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                 return np.log10(iMetaD_FitCDF(temp_taus, temp_event, k_mle))
             res = bootstrap(list(range(N)),select_runs_iMetaD_CDF,100)
             results["iMetaD CDF std k"] = res
-            print(f"iMetaD CDF: logk = {np.log10(k)} +/- {res}, KS: {ks_stat}, p = {p}")
+            print(f"iMetaD CDF: logk = {np.log10(k*rate_conv)} +/- {res}, KS: {ks_stat}, p = {p}")
         else:
-            print(f"iMetaD CDF: k = {k}, KS: {ks_stat}, p = {p}")
+            print(f"iMetaD CDF: k = {k*rate_conv}, KS: {ks_stat}, p = {p}")
 
         if ks_ranges:
             
@@ -407,9 +449,9 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                 if p > 0.05:
                     good_fit = k_i
             if good_fit is not None:
-                results["iMetaD CDF KS klo"] = good_fit
+                results["iMetaD CDF KS klo"] = good_fit*rate_conv
             else:
-                results["iMetaD CDF KS klo"] = k
+                results["iMetaD CDF KS klo"] = k*rate_conv
 
             good_fit = None
             k_i = k
@@ -421,9 +463,9 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                 if p > 0.05:
                     good_fit = k_i
             if good_fit is not None:
-                results["iMetaD CDF KS khi"] = good_fit
+                results["iMetaD CDF KS khi"] = good_fit*rate_conv
             else:
-                results["iMetaD CDF KS khi"] = k
+                results["iMetaD CDF KS khi"] = k*rate_conv
 
             print(f"iMetaD CDF Passes: k0: {results['iMetaD CDF KS klo']} to {results['iMetaD CDF KS khi']}")
 
@@ -445,14 +487,14 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
             for i in range(N):
                 max_accumulate.append(data[i][:,columns["max_bias"]].copy())
         
-        vmb_average = avg_max_bias(max_accumulate, data, colvars_count, colvars_maxrow_count, beta)
+        vmb_average = avg_max_bias(max_accumulate, data, colvars_count, colvars_maxrow_count, beta, bias_shift=bias_shift)
 
         # Finally calculate the rate
-        mle_result, spline = KTR_MLE_rate(vmb_average, t, event, gamma_bounds, cores, logTrick)
+        mle_result, spline = KTR_MLE_rate(vmb_average, t, event, gamma_bounds, cores, logTrick, lambda_KTR)
 
         if analyses["KTR Vmb MLE"]:
             ks_stat, p = ks_1samp(final_times[:,0],KTR_CDF,args=(mle_result[0],mle_result[1],spline,logTrick)) # 1-sample test because the KTR CDF takes a while to sample, apparently.
-            results["KTR Vmb MLE k"] = mle_result[0]
+            results["KTR Vmb MLE k"] = mle_result[0]*rate_conv
             results["KTR Vmb MLE g"] = mle_result[1]
 
             if boots:
@@ -464,23 +506,23 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                     temp_cc = len(run_idx)
                     temp_cmc = np.max([len(c) for c in temp_data])
 
-                    temp_vmb = avg_max_bias(temp_maxbias, temp_data, temp_cc, temp_cmc, beta)
-                    result, _ = KTR_MLE_rate(temp_vmb, temp_t, temp_event, gamma_bounds, cores, logTrick)
+                    temp_vmb = avg_max_bias(temp_maxbias, temp_data, temp_cc, temp_cmc, beta, bias_shift=bias_shift)
+                    result, _ = KTR_MLE_rate(temp_vmb, temp_t, temp_event, gamma_bounds, cores, logTrick, lambda_KTR)
                     return np.log10(result[0]), result[1]
 
                 res_k, res_g = bootstrap(list(range(N)),select_runs_KTR_MLE,100,double=True)
                 
                 results["KTR Vmb MLE std k"] = res_k
                 results["KTR Vmb MLE std g"] = res_g
-                print(f"KTR Vmb MLE: logk = {np.log10(mle_result[0])} +/- {res_k}, gamma: {mle_result[1]} +/- {res_g}, KS: {ks_stat}, p = {p}")
+                print(f"KTR Vmb MLE: logk = {np.log10(mle_result[0]*rate_conv)} +/- {res_k}, gamma: {mle_result[1]} +/- {res_g}, KS: {ks_stat}, p = {p}")
             else:
-                print(f"KTR Vmb MLE: k = {mle_result[0]}, gamma: {mle_result[1]}, KS: {ks_stat}, p = {p}")
+                print(f"KTR Vmb MLE: k = {mle_result[0]*rate_conv}, gamma: {mle_result[1]}, KS: {ks_stat}, p = {p}")
         
         if analyses["KTR Vmb CDF"]:
             
-            cdf_result, spline = KTR_CDF_rate(vmb_average, t, gamma_bounds, event, cores, logTrick, mle_result)
+            cdf_result, spline = KTR_CDF_rate(vmb_average, t, gamma_bounds, event, cores, logTrick, init_guess, lambda_KTR, k)
             ks_stat, p = ks_1samp(final_times[:,0],KTR_CDF,args=(cdf_result[0],cdf_result[1],spline,logTrick))
-            results["KTR Vmb CDF k"] = cdf_result[0]
+            results["KTR Vmb CDF k"] = cdf_result[0]*rate_conv
             results["KTR Vmb CDF g"] = cdf_result[1]
 
             if boots:
@@ -492,17 +534,17 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                     temp_cc = len(run_idx)
                     temp_cmc = np.max([len(c) for c in temp_data])
 
-                    temp_vmb = avg_max_bias(temp_maxbias, temp_data, temp_cc, temp_cmc, beta)
-                    result, _ = KTR_CDF_rate(temp_vmb, temp_t, gamma_bounds, temp_event, cores, logTrick, mle_result)
+                    temp_vmb = avg_max_bias(temp_maxbias, temp_data, temp_cc, temp_cmc, beta, bias_shift=bias_shift)
+                    result, _ = KTR_CDF_rate(temp_vmb, temp_t, gamma_bounds, temp_event, cores, logTrick, init_guess, lambda_KTR, k)
                     return np.log10(result[0]), result[1]
 
                 res_k, res_g = bootstrap(list(range(N)),select_runs_KTR_CDF,100,double=True)
 
                 results["KTR Vmb CDF std k"] = res_k
                 results["KTR Vmb CDF std g"] = res_g
-                print(f"KTR Vmb CDF: logk = {np.log10(cdf_result[0])} +/- {res_k}, gamma: {cdf_result[1]} +/- {res_g}, KS: {ks_stat}, p = {p}")
+                print(f"KTR Vmb CDF: logk = {np.log10(cdf_result[0]*rate_conv)} +/- {res_k}, gamma: {cdf_result[1]} +/- {res_g}, KS: {ks_stat}, p = {p}")
             else:
-                print(f"KTR Vmb CDF: {cdf_result[0]}, gamma: {cdf_result[1]}, KS: {ks_stat}, p = {p}")
+                print(f"KTR Vmb CDF: k = {cdf_result[0]*rate_conv}, gamma: {cdf_result[1]}, KS: {ks_stat}, p = {p}")
 
             if ks_ranges:
                 good_fit = None
@@ -510,16 +552,16 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                 p = 0.06
                 while p > 0.05 and gamma_i > gamma_bounds[0]:
                     gamma_i -= 0.02
-                    cdf_result_i, spline = KTR_CDF_rate(vmb_average, t, (gamma_i-0.00000000001,gamma_i), event, cores, logTrick, (mle_result[0],gamma_i))
+                    cdf_result_i, spline = KTR_CDF_rate(vmb_average, t, (gamma_i-0.00000000001,gamma_i), event, cores, logTrick, (init_guess[0],gamma_i), lambda_KTR, k)
                     #cdf_result_i = optimize.curve_fit(KTR_CDF, ecdf_data[:,0], ecdf_data[:,1], p0=(mle_result[0],gamma_i), bounds=([-np.inf,gamma_i-0.00000000001],[np.inf,gamma_i]))
                     _, p = ks_1samp(final_times[:,0],KTR_CDF,args=(cdf_result_i[0],cdf_result_i[1],spline,logTrick))
                     if p > 0.05:
                         good_fit = cdf_result_i
                 if good_fit is not None:
-                    results["KTR Vmb CDF KS khi"] = good_fit[0]
+                    results["KTR Vmb CDF KS khi"] = good_fit[0]*rate_conv
                     results["KTR Vmb CDF KS glo"] = good_fit[1]
                 else:
-                    results["KTR Vmb CDF KS khi"] = cdf_result[0]
+                    results["KTR Vmb CDF KS khi"] = cdf_result[0]*rate_conv
                     results["KTR Vmb CDF KS glo"] = cdf_result[1]
                 
                 good_fit = None
@@ -527,16 +569,16 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                 p = 0.06
                 while p > 0.05 and gamma_i < gamma_bounds[1]:
                     gamma_i += 0.02
-                    cdf_result_i, spline = KTR_CDF_rate(vmb_average, t, (gamma_i-0.00000000001,gamma_i), event, cores, logTrick, (mle_result[0],gamma_i))
+                    cdf_result_i, spline = KTR_CDF_rate(vmb_average, t, (gamma_i-0.00000000001,gamma_i), event, cores, logTrick, (init_guess[0],gamma_i), lambda_KTR, k)
                     #cdf_result_i = optimize.curve_fit(KTR_CDF, ecdf_data[:,0], ecdf_data[:,1], p0=(mle_result[0],gamma_i), bounds=([-np.inf,gamma_i-0.00000000001],[np.inf,gamma_i]))
                     _, p = ks_1samp(final_times[:,0],KTR_CDF,args=(cdf_result_i[0],cdf_result_i[1],spline,logTrick))
                     if p > 0.05:
                         good_fit = cdf_result_i
                 if good_fit is not None:
-                    results["KTR Vmb CDF KS klo"] = good_fit[0]
+                    results["KTR Vmb CDF KS klo"] = good_fit[0]*rate_conv
                     results["KTR Vmb CDF KS ghi"] = good_fit[1]
                 else:
-                    results["KTR Vmb CDF KS klo"] = cdf_result[0]
+                    results["KTR Vmb CDF KS klo"] = cdf_result[0]*rate_conv
                     results["KTR Vmb CDF KS ghi"] = cdf_result[1]
 
                 print(f"KTR Vmb CDF Passes: gamma: {results['KTR Vmb CDF KS glo']} to {results['KTR Vmb CDF KS ghi']}, k0: {results['KTR Vmb CDF KS klo']} to {results['KTR Vmb CDF KS khi']}")
@@ -545,16 +587,16 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
     ### EATR Method ###
     if actions_needed["avg_acc"]:
 
-        v_data, ix_col = inst_bias(data, colvars_count, colvars_maxrow_count, beta, columns["bias"])
+        v_data, ix_col = inst_bias(data, colvars_count, colvars_maxrow_count, beta, columns["bias"], bias_shift=bias_shift)
 
-        mle_result, spline = EATR_MLE_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, logTrick=logTrick)
+        mle_result, spline = EATR_MLE_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, logTrick=logTrick, reg_lambda=lambda_EATR)
 
         def tcdf(time, k0, gamma):
             return EATR_CDF(time, k0, gamma, spline, cores, logTrick=logTrick)
 
         if analyses["EATR MLE"]:
             ks_stat, p = ks_1samp(final_times[:,0],EATR_CDF,args=(mle_result[0],mle_result[1],spline,cores,logTrick))
-            results["EATR MLE k"] = mle_result[0]
+            results["EATR MLE k"] = mle_result[0]*rate_conv
             results["EATR MLE g"] = mle_result[1]
             if boots:
                 def select_runs_EATR_MLE(run_idx):
@@ -564,24 +606,24 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                     temp_cc = len(run_idx)
                     temp_cmc = np.max([len(c) for c in temp_data])
 
-                    temp_v, temp_ixcol = inst_bias(temp_data, temp_cc, temp_cmc, beta, columns["bias"])
-                    result, _ = EATR_MLE_rate(temp_v, temp_t, temp_event, gamma_bounds, beta, temp_ixcol, cores, logTrick=logTrick)
+                    temp_v, temp_ixcol = inst_bias(temp_data, temp_cc, temp_cmc, beta, columns["bias"], bias_shift=bias_shift)
+                    result, _ = EATR_MLE_rate(temp_v, temp_t, temp_event, gamma_bounds, beta, temp_ixcol, cores, logTrick=logTrick, reg_lambda=lambda_EATR)
                     return np.log10(result[0]), result[1]
                     
                 res_k, res_g = bootstrap(list(range(N)),select_runs_EATR_MLE,100,double=True)
 
                 results["EATR MLE std k"] = res_k
                 results["EATR MLE std g"] = res_g
-                print(f"EATR MLE: logk = {np.log10(mle_result[0])} +/- {res_k}, gamma: {mle_result[1]} +/- {res_g}, KS: {ks_stat}, p = {p}")
+                print(f"EATR MLE: logk = {np.log10(mle_result[0]*rate_conv)} +/- {res_k}, gamma: {mle_result[1]} +/- {res_g}, KS: {ks_stat}, p = {p}")
             else:
-                print(f"EATR MLE: {mle_result[0]}, gamma: {mle_result[1]}, KS: {ks_stat}, p = {p}")
+                print(f"EATR MLE: k = {mle_result[0]*rate_conv}, gamma: {mle_result[1]}, KS: {ks_stat}, p = {p}")
 
         if analyses["EATR CDF"]:
 
-            cdf_result, spline = EATR_CDF_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, mle_result, logTrick=logTrick)
+            cdf_result, spline = EATR_CDF_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, init_guess, logTrick=logTrick, reg_lambda=lambda_EATR, kIMD=k)
 
             ks_stat, p = ks_1samp(final_times[:,0],EATR_CDF,args=(cdf_result[0],cdf_result[1],spline,cores,logTrick))
-            results["EATR CDF k"] = cdf_result[0]
+            results["EATR CDF k"] = cdf_result[0]*rate_conv
             results["EATR CDF g"] = cdf_result[1]
 
             if boots:
@@ -592,17 +634,17 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                     temp_cc = len(run_idx)
                     temp_cmc = np.max([len(c) for c in temp_data])
 
-                    temp_v, temp_ixcol = inst_bias(temp_data, temp_cc, temp_cmc, beta, columns["bias"])
-                    result, _ = EATR_CDF_rate(temp_v, temp_t, temp_event, gamma_bounds, beta, temp_ixcol, cores, mle_result, logTrick=logTrick) # Make function
+                    temp_v, temp_ixcol = inst_bias(temp_data, temp_cc, temp_cmc, beta, columns["bias"], bias_shift=bias_shift)
+                    result, _ = EATR_CDF_rate(temp_v, temp_t, temp_event, gamma_bounds, beta, temp_ixcol, cores, init_guess, logTrick=logTrick, reg_lambda=lambda_EATR, kIMD=k) # Make function
                     return np.log10(result[0]), result[1]
 
                 res_k, res_g = bootstrap(list(range(N)),select_runs_EATR_CDF,100,double=True)
 
                 results["EATR CDF std k"] = res_k
                 results["EATR CDF std g"] = res_g
-                print(f"EATR CDF: logk = {np.log10(cdf_result[0])} +/- {res_k}, gamma: {cdf_result[1]} +/- {res_g}, KS: {ks_stat}, p = {p}")
+                print(f"EATR CDF: logk = {np.log10(cdf_result[0]*rate_conv)} +/- {res_k}, gamma: {cdf_result[1]} +/- {res_g}, KS: {ks_stat}, p = {p}")
             else:
-                print(f"EATR CDF: {cdf_result[0]}, gamma: {cdf_result[1]}, KS: {ks_stat}, p = {p}")
+                print(f"EATR CDF: k = {cdf_result[0]*rate_conv}, gamma: {cdf_result[1]}, KS: {ks_stat}, p = {p}")
 
             if ks_ranges:
                 good_fit = None
@@ -610,16 +652,16 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                 p = 0.06
                 while p > 0.05 and gamma_i > gamma_bounds[0]:
                     gamma_i -= 0.02
-                    cdf_result_i, spline = EATR_CDF_rate(v_data, t, event, (gamma_i-0.00000000001,gamma_i), beta, ix_col, cores, (mle_result[0],gamma_i), logTrick=logTrick)
+                    cdf_result_i, spline = EATR_CDF_rate(v_data, t, event, (gamma_i-0.00000000001,gamma_i), beta, ix_col, cores, (init_guess[0],gamma_i), logTrick=logTrick, reg_lambda=lambda_EATR, kIMD=k)
                     #cdf_result_i = optimize.curve_fit(tcdf, ecdf_data[:,0], ecdf_data[:,1], p0=(mle_result[0],gamma_i), bounds=([-np.inf,gamma_i-0.00000000001],[np.inf,gamma_i]))
                     _, p = ks_1samp(final_times[:,0],tcdf,args=(cdf_result_i[0],cdf_result_i[1]))
                     if p > 0.05:
                         good_fit = cdf_result_i
                 if good_fit is not None:
-                    results["EATR CDF KS khi"] = good_fit[0]
+                    results["EATR CDF KS khi"] = good_fit[0]*rate_conv
                     results["EATR CDF KS glo"] = good_fit[1]
                 else:
-                    results["EATR CDF KS khi"] = cdf_result[0]
+                    results["EATR CDF KS khi"] = cdf_result[0]*rate_conv
                     results["EATR CDF KS glo"] = cdf_result[1]
                 
                 good_fit = None
@@ -627,16 +669,16 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                 p = 0.06
                 while p > 0.05 and gamma_i < gamma_bounds[1]:
                     gamma_i += 0.02
-                    cdf_result_i, spline = EATR_CDF_rate(v_data, t, event, (gamma_i-0.00000000001,gamma_i), beta, ix_col, cores, (mle_result[0],gamma_i), logTrick=logTrick)
+                    cdf_result_i, spline = EATR_CDF_rate(v_data, t, event, (gamma_i-0.00000000001,gamma_i), beta, ix_col, cores, (init_guess[0],gamma_i), logTrick=logTrick, reg_lambda=lambda_EATR, kIMD=k)
                     #cdf_result_i = optimize.curve_fit(tcdf, ecdf_data[:,0], ecdf_data[:,1], p0=(mle_result[0],gamma_i), bounds=([-np.inf,gamma_i-0.00000000001],[np.inf,gamma_i]))
                     _, p = ks_1samp(final_times[:,0],tcdf,args=(cdf_result_i[0],cdf_result_i[1]))
                     if p > 0.05:
                         good_fit = cdf_result_i
                 if good_fit is not None:
-                    results["EATR CDF KS klo"] = good_fit[0]
+                    results["EATR CDF KS klo"] = good_fit[0]*rate_conv
                     results["EATR CDF KS ghi"] = good_fit[1]
                 else:
-                    results["EATR CDF KS klo"] = cdf_result[0]
+                    results["EATR CDF KS klo"] = cdf_result[0]*rate_conv
                     results["EATR CDF KS ghi"] = cdf_result[1]
 
                 print(f"EATR CDF KS Passes: gamma: {results['EATR CDF KS glo']} to {results['EATR CDF KS ghi']}, k0: {results['EATR CDF KS klo']} to {results['EATR CDF KS khi']}")
