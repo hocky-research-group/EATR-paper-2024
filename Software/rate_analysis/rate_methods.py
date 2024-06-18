@@ -153,7 +153,7 @@ def KTR_MLE_rate(vmb_average, t, event, gamma_bounds, cores, logTrick, reg_lambd
     mean_t = cum_hazard.sum() / event.sum()
     return np.array([1/mean_t, gamma]), spline
 
-def KTR_CDF_rate(vmb_average, t, gamma_bounds, event, cores, logTrick, k_guess, reg_lambda=0.0, kIMD=1.0):
+def KTR_CDF_rate(vmb_average, t, k_bounds, gamma_bounds, event, cores, logTrick, k_guess, reg_lambda=0.0, kIMD=1.0):
     
     # 2-parameter CDF fitting for gamma and k0
     counts = np.sort(t[event])
@@ -167,7 +167,7 @@ def KTR_CDF_rate(vmb_average, t, gamma_bounds, event, cores, logTrick, k_guess, 
     if reg_lambda == 0.0:
         def KTR_CDF_simple(t,k0,gamma):
             return KTR_CDF(t,k0,gamma,spline,logTrick=logTrick)
-        cdf_result = optimize.curve_fit(KTR_CDF_simple, ecdf_data[:,0], ecdf_data[:,1], p0=k_guess, bounds=([-np.inf,gamma_bounds[0]],[np.inf,gamma_bounds[1]]))
+        cdf_result = optimize.curve_fit(KTR_CDF_simple, ecdf_data[:,0], ecdf_data[:,1], p0=k_guess, bounds=([k_bounds[0],gamma_bounds[0]],[k_bounds[1],gamma_bounds[1]]))
     else:
         cdf_result = (optimize.minimize(KTR_leastsq_cost,k_guess,args=(ecdf_data[:,0],ecdf_data[:,1],spline,cores,logTrick,reg_lambda,kIMD)).x,)
     return cdf_result[0], spline
@@ -276,7 +276,7 @@ def EATR_MLE_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, logTrick=
 
     return np.array([1/mean_t, gamma]), spline
 
-def EATR_CDF_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, k_guess, logTrick=False, reg_lambda=0.0, kIMD=1.0):
+def EATR_CDF_rate(v_data, t, event, k_bounds, gamma_bounds, beta, ix_col, cores, k_guess, logTrick=False, reg_lambda=0.0, kIMD=1.0):
 
     def tcdf(time, k0, gamma):
         spline = EATR_calculate_avg_acc(gamma, v_data, beta, ix_col, logTrick=logTrick)
@@ -288,13 +288,14 @@ def EATR_CDF_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, k_guess, 
     ecdf_data=np.column_stack((counts, ecdf))
 
     if reg_lambda == 0.0:
-        cdf_result = optimize.curve_fit(tcdf, ecdf_data[:,0], ecdf_data[:,1], p0=k_guess, bounds=([-np.inf,gamma_bounds[0]],[np.inf,gamma_bounds[1]]))
+        cdf_result = optimize.curve_fit(tcdf, ecdf_data[:,0], ecdf_data[:,1], p0=k_guess, bounds=([k_bounds[0],gamma_bounds[0]],[k_bounds[1],gamma_bounds[1]]))
     else:
         cdf_result = (optimize.minimize(EATR_leastsq_cost,k_guess,args=(ecdf_data[:,0],ecdf_data[:,1],spline,cores,logTrick,reg_lambda,kIMD)).x,)
     spline = EATR_calculate_avg_acc(cdf_result[0][1], v_data, beta, ix_col, logTrick=logTrick)
     return cdf_result[0], spline
 
-def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name,plog_len,cores,rate_conv=1.,ks_ranges=False,boots=False,logTrick=False,incon_names=False,bias_shift=0.0,lambda_KTR=0.0,lambda_EATR=0.0):
+# Note: Regularization ignores enforced rates.
+def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name,plog_len,cores,rate_conv=1.,ks_ranges=False,boots=False,logTrick=False,incon_names=False,bias_shift=0.0,lambda_KTR=0.0,lambda_EATR=0.0,IMD_init_guess=False,enforced_rate=None):
 
     results = {
             "iMetaD MLE k": None,
@@ -364,6 +365,8 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
         final_times[i,:] = np.array([data[-1][-1][columns["time"]],data[-1][-1][columns["time"]] * data[-1][-1][columns["acc"]]]) if not actions_needed["calc_acc"] else np.array([data[-1][-1][columns["time"]],0]) # final_times[i,0] is simulation i's transition time while final_times[i,1] is the iMetaD rescaled time.
         i = i+1
 
+    k = 1. # Uninitialized value for the iMetaD CDF rate. This allows bootstrapping and KS ranges in the KTR and EATR parts of this function. Do not use regularization without running iMetaD CDF.
+
     if actions_needed["calc_acc"]:
         acc = calc_acc(data, columns["time"], columns["bias"], beta, bias_shift=bias_shift)
         final_times[:,1] = final_times[:,0]*acc
@@ -416,7 +419,8 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
 
         # Fit ECDF to theoretical CDF
         k = iMetaD_FitCDF(taus, event, k_mle)
-        init_guess[0] = k
+        if IMD_init_guess:
+            init_guess[0] = k
 
         # Compute Kolmogorov-Smirnov Statistic
         size = np.int64(len(final_times[:,1])*5e4)
@@ -469,6 +473,11 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
 
             print(f"iMetaD CDF Passes: k0: {results['iMetaD CDF KS klo']} to {results['iMetaD CDF KS khi']}")
 
+    # Restrict the CDF fits for KTR and EATR to a specific value of k0 to find gamma
+    k_bounds = [-np.inf,np.inf]
+    if enforced_rate is not None:
+        k_bounds = [enforced_rate,enforced_rate+0.0000001]
+        init_guess[0] = enforced_rate
 
     # Estimate maximum bias from colvar data and save to max_accumulate if we're using a max bias measure.
     max_accumulate = []
@@ -491,6 +500,10 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
 
         # Finally calculate the rate
         mle_result, spline = KTR_MLE_rate(vmb_average, t, event, gamma_bounds, cores, logTrick, lambda_KTR)
+        if not IMD_init_guess:
+            init_guess[1] = mle_result[1]
+            if enforced_rate is None:
+                init_guess[0] = mle_result[0]
 
         if analyses["KTR Vmb MLE"]:
             ks_stat, p = ks_1samp(final_times[:,0],KTR_CDF,args=(mle_result[0],mle_result[1],spline,logTrick)) # 1-sample test because the KTR CDF takes a while to sample, apparently.
@@ -520,7 +533,7 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
         
         if analyses["KTR Vmb CDF"]:
             
-            cdf_result, spline = KTR_CDF_rate(vmb_average, t, gamma_bounds, event, cores, logTrick, init_guess, lambda_KTR, k)
+            cdf_result, spline = KTR_CDF_rate(vmb_average, t, k_bounds, gamma_bounds, event, cores, logTrick, init_guess, lambda_KTR, k)
             ks_stat, p = ks_1samp(final_times[:,0],KTR_CDF,args=(cdf_result[0],cdf_result[1],spline,logTrick))
             results["KTR Vmb CDF k"] = cdf_result[0]*rate_conv
             results["KTR Vmb CDF g"] = cdf_result[1]
@@ -535,7 +548,7 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                     temp_cmc = np.max([len(c) for c in temp_data])
 
                     temp_vmb = avg_max_bias(temp_maxbias, temp_data, temp_cc, temp_cmc, beta, bias_shift=bias_shift)
-                    result, _ = KTR_CDF_rate(temp_vmb, temp_t, gamma_bounds, temp_event, cores, logTrick, init_guess, lambda_KTR, k)
+                    result, _ = KTR_CDF_rate(temp_vmb, temp_t, k_bounds, gamma_bounds, temp_event, cores, logTrick, init_guess, lambda_KTR, k)
                     return np.log10(result[0]), result[1]
 
                 res_k, res_g = bootstrap(list(range(N)),select_runs_KTR_CDF,100,double=True)
@@ -552,7 +565,7 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                 p = 0.06
                 while p > 0.05 and gamma_i > gamma_bounds[0]:
                     gamma_i -= 0.02
-                    cdf_result_i, spline = KTR_CDF_rate(vmb_average, t, (gamma_i-0.00000000001,gamma_i), event, cores, logTrick, (init_guess[0],gamma_i), lambda_KTR, k)
+                    cdf_result_i, spline = KTR_CDF_rate(vmb_average, t, k_bounds, (gamma_i-0.00000000001,gamma_i), event, cores, logTrick, (init_guess[0],gamma_i), lambda_KTR, k)
                     #cdf_result_i = optimize.curve_fit(KTR_CDF, ecdf_data[:,0], ecdf_data[:,1], p0=(mle_result[0],gamma_i), bounds=([-np.inf,gamma_i-0.00000000001],[np.inf,gamma_i]))
                     _, p = ks_1samp(final_times[:,0],KTR_CDF,args=(cdf_result_i[0],cdf_result_i[1],spline,logTrick))
                     if p > 0.05:
@@ -569,7 +582,7 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                 p = 0.06
                 while p > 0.05 and gamma_i < gamma_bounds[1]:
                     gamma_i += 0.02
-                    cdf_result_i, spline = KTR_CDF_rate(vmb_average, t, (gamma_i-0.00000000001,gamma_i), event, cores, logTrick, (init_guess[0],gamma_i), lambda_KTR, k)
+                    cdf_result_i, spline = KTR_CDF_rate(vmb_average, t, k_bounds, (gamma_i-0.00000000001,gamma_i), event, cores, logTrick, (init_guess[0],gamma_i), lambda_KTR, k)
                     #cdf_result_i = optimize.curve_fit(KTR_CDF, ecdf_data[:,0], ecdf_data[:,1], p0=(mle_result[0],gamma_i), bounds=([-np.inf,gamma_i-0.00000000001],[np.inf,gamma_i]))
                     _, p = ks_1samp(final_times[:,0],KTR_CDF,args=(cdf_result_i[0],cdf_result_i[1],spline,logTrick))
                     if p > 0.05:
@@ -590,6 +603,10 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
         v_data, ix_col = inst_bias(data, colvars_count, colvars_maxrow_count, beta, columns["bias"], bias_shift=bias_shift)
 
         mle_result, spline = EATR_MLE_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, logTrick=logTrick, reg_lambda=lambda_EATR)
+        if not IMD_init_guess:
+            init_guess[1] = mle_result[1]
+            if enforced_rate is None:
+                init_guess[0] = mle_result[0]
 
         def tcdf(time, k0, gamma):
             return EATR_CDF(time, k0, gamma, spline, cores, logTrick=logTrick)
@@ -620,7 +637,7 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
 
         if analyses["EATR CDF"]:
 
-            cdf_result, spline = EATR_CDF_rate(v_data, t, event, gamma_bounds, beta, ix_col, cores, init_guess, logTrick=logTrick, reg_lambda=lambda_EATR, kIMD=k)
+            cdf_result, spline = EATR_CDF_rate(v_data, t, event, k_bounds, gamma_bounds, beta, ix_col, cores, init_guess, logTrick=logTrick, reg_lambda=lambda_EATR, kIMD=k)
 
             ks_stat, p = ks_1samp(final_times[:,0],EATR_CDF,args=(cdf_result[0],cdf_result[1],spline,cores,logTrick))
             results["EATR CDF k"] = cdf_result[0]*rate_conv
@@ -635,7 +652,7 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                     temp_cmc = np.max([len(c) for c in temp_data])
 
                     temp_v, temp_ixcol = inst_bias(temp_data, temp_cc, temp_cmc, beta, columns["bias"], bias_shift=bias_shift)
-                    result, _ = EATR_CDF_rate(temp_v, temp_t, temp_event, gamma_bounds, beta, temp_ixcol, cores, init_guess, logTrick=logTrick, reg_lambda=lambda_EATR, kIMD=k) # Make function
+                    result, _ = EATR_CDF_rate(temp_v, temp_t, temp_event, k_bounds, gamma_bounds, beta, temp_ixcol, cores, init_guess, logTrick=logTrick, reg_lambda=lambda_EATR, kIMD=k) # Make function
                     return np.log10(result[0]), result[1]
 
                 res_k, res_g = bootstrap(list(range(N)),select_runs_EATR_CDF,100,double=True)
@@ -652,7 +669,7 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                 p = 0.06
                 while p > 0.05 and gamma_i > gamma_bounds[0]:
                     gamma_i -= 0.02
-                    cdf_result_i, spline = EATR_CDF_rate(v_data, t, event, (gamma_i-0.00000000001,gamma_i), beta, ix_col, cores, (init_guess[0],gamma_i), logTrick=logTrick, reg_lambda=lambda_EATR, kIMD=k)
+                    cdf_result_i, spline = EATR_CDF_rate(v_data, t, event, k_bounds, (gamma_i-0.00000000001,gamma_i), beta, ix_col, cores, (init_guess[0],gamma_i), logTrick=logTrick, reg_lambda=lambda_EATR, kIMD=k)
                     #cdf_result_i = optimize.curve_fit(tcdf, ecdf_data[:,0], ecdf_data[:,1], p0=(mle_result[0],gamma_i), bounds=([-np.inf,gamma_i-0.00000000001],[np.inf,gamma_i]))
                     _, p = ks_1samp(final_times[:,0],tcdf,args=(cdf_result_i[0],cdf_result_i[1]))
                     if p > 0.05:
@@ -669,7 +686,7 @@ def rates(directory,runs,analyses,columns,beta,gamma_bounds,colvar_name,log_name
                 p = 0.06
                 while p > 0.05 and gamma_i < gamma_bounds[1]:
                     gamma_i += 0.02
-                    cdf_result_i, spline = EATR_CDF_rate(v_data, t, event, (gamma_i-0.00000000001,gamma_i), beta, ix_col, cores, (init_guess[0],gamma_i), logTrick=logTrick, reg_lambda=lambda_EATR, kIMD=k)
+                    cdf_result_i, spline = EATR_CDF_rate(v_data, t, event, k_bounds, (gamma_i-0.00000000001,gamma_i), beta, ix_col, cores, (init_guess[0],gamma_i), logTrick=logTrick, reg_lambda=lambda_EATR, kIMD=k)
                     #cdf_result_i = optimize.curve_fit(tcdf, ecdf_data[:,0], ecdf_data[:,1], p0=(mle_result[0],gamma_i), bounds=([-np.inf,gamma_i-0.00000000001],[np.inf,gamma_i]))
                     _, p = ks_1samp(final_times[:,0],tcdf,args=(cdf_result_i[0],cdf_result_i[1]))
                     if p > 0.05:
